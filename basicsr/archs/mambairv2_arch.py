@@ -241,13 +241,22 @@ class ASSM(nn.Module):
             nn.LogSoftmax(dim=-1)
         )
 
-    def forward(self, x, x_size, token, depth=None, confidence=None, enable_gtss=False):
+    def forward(self, x, x_size, token, depth=None, confidence=None, enable_gtss=False,
+                ambiguity_collector=None):
         B, n, C = x.shape
         H, W = x_size
 
         full_embedding = self.embeddingB.weight @ token.weight  # [128, C]
 
         pred_route = self.route(x)  # [B, HW, num_token]
+        # UDR v3.2: read-only entropy in ORIGINAL spatial order, before Gumbel/sort.
+        # LogSoftmax is already in route; softmax(log p) recovers the same p.
+        # A local collector avoids persistent autograd graphs and consumes no RNG.
+        if ambiguity_collector is not None:
+            probability = pred_route.float().softmax(dim=-1)
+            entropy = -(probability * probability.clamp_min(1e-12).log()).sum(-1)
+            entropy = entropy / math.log(self.num_tokens)
+            ambiguity_collector.append(entropy.clamp(0, 1).reshape(B, 1, H, W))
         cls_policy = F.gumbel_softmax(pred_route, hard=True, dim=-1)  # [B, HW, num_token]
 
         prompt = torch.matmul(cls_policy, full_embedding).view(B, n, self.d_state)
@@ -519,7 +528,8 @@ class AttentiveLayer(nn.Module):
         shortcut = x
         x_aca = self.assm(self.norm3(x), x_size, self.embeddingA,
                           depth=params.get('depth'), confidence=params.get('confidence'),
-                          enable_gtss=params.get('enable_gtss', False)) + x
+                          enable_gtss=params.get('enable_gtss', False),
+                          ambiguity_collector=params.get('ambiguity_collector')) + x
         x = x_aca + self.convffn2(self.norm4(x_aca), x_size)
         x = shortcut * self.scale2 + x
 
